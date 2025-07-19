@@ -1,0 +1,82 @@
+# HP Printer Monitor - Task Scheduler Setup
+# Creates Windows scheduled task to run twice daily (08:00 and 14:00)
+# Run as Administrator
+
+# Configuration
+$taskName = "HPPrinterMonitor"
+$scriptPath = "C:\PrinterMonitor\complete_printer_monitor.ps1"
+$workingDirectory = "C:\PrinterMonitor"
+
+Write-Host "HP PRINTER MONITOR - SCHEDULER SETUP"
+Write-Host "====================================="
+Write-Host "Task Name: $taskName"
+Write-Host "Schedule: Daily at 08:00 and 14:00"
+Write-Host "Script Path: $scriptPath"
+Write-Host ""
+
+# Remove existing task if exists
+try {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "Existing task removed"
+} catch {
+    Write-Host "No existing task found"
+}
+
+try {
+    # Task action
+    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -File `"$scriptPath`"" -WorkingDirectory $workingDirectory
+    
+    # Two triggers (08:00 and 14:00)
+    $trigger1 = New-ScheduledTaskTrigger -Daily -At "08:00"
+    $trigger2 = New-ScheduledTaskTrigger -Daily -At "14:00"
+    
+    # Task settings
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    
+    # Security settings
+    $principal = New-ScheduledTaskPrincipal -UserID "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    
+    # Register task with both triggers
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger1, $trigger2) -Settings $settings -Principal $principal -Description "HP Printer toner monitoring - runs twice daily (08:00 and 14:00)"
+    
+    Write-Host "SUCCESS! Scheduled task created" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Task Details:"
+    Write-Host "- Morning: 08:00"
+    Write-Host "- Afternoon: 14:00"
+    Write-Host "- Account: SYSTEM"
+    Write-Host "- Status: Active"
+    Write-Host ""
+    Write-Host "To verify: taskschd.msc -> Task Scheduler Library -> $taskName"
+    
+} catch {
+    Write-Host "ERROR creating task: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "MANUAL SETUP INSTRUCTIONS:"
+    Write-Host "1. Open: Win + R -> taskschd.msc"
+    Write-Host "2. Create Basic Task"
+    Write-Host "3. Name: $taskName"
+    Write-Host "4. Trigger: Daily"
+    Write-Host "5. Time: 08:00 (create second task for 14:00)"
+    Write-Host "6. Action: Start a program"
+    Write-Host "7. Program: PowerShell.exe"
+    Write-Host "8. Arguments: -ExecutionPolicy Bypass -File `"$scriptPath`""
+    Write-Host "9. Start in: $workingDirectory"
+}
+
+# Test option
+Write-Host ""
+$testChoice = Read-Host "Test run now? (y/n)"
+if ($testChoice -eq 'y' -or $testChoice -eq 'Y') {
+    Write-Host "Starting test run..."
+    try {
+        Start-ScheduledTask -TaskName $taskName
+        Write-Host "Test started successfully!"
+    } catch {
+        Write-Host "Test start error: $($_.Exception.Message)"
+    }
+}
+
+Write-Host ""
+Write-Host "Setup completed!"
+Write-Host "==============="

@@ -1,0 +1,368 @@
+# HP Printer Toner Monitor
+# Monitors HP printers via web interface, detects low toner, sends email alerts
+
+# TLS settings
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+
+# EMAIL CONFIGURATION
+$EMAIL_SMTP_SERVER = "smtp.company.local"
+$EMAIL_PORT = 25
+$EMAIL_FROM = "printer-alerts@company.local"
+$EMAIL_TO = "supplies@company.local"
+$EMAIL_USE_AUTH = $false
+$EMAIL_USERNAME = ""
+$EMAIL_PASSWORD = ""
+
+# PRINTER IP ADDRESSES
+$printerIPs = @(
+    "192.168.1.100",
+    "192.168.1.101",
+    "192.168.1.102"
+)
+
+# HTML PARSING RANGE - Adjust for your printer model
+$SUPPLY_START_LINE = 180
+$SUPPLY_END_LINE = 220
+$YELLOW_CHECK_LINES = 5
+
+# Extract toner level from HTML - supports <10% format
+function Get-TonerLevel {
+    param([string]$htmlContent, [int]$supplyIndex)
+    
+    Write-Host "    Checking SupplyPLR$supplyIndex"
+    
+    $spanPattern = "id=`"SupplyPLR$supplyIndex`"[^>]*>([^<]*)</span>"
+    $spanMatch = [regex]::Match($htmlContent, $spanPattern)
+    
+    if (-not $spanMatch.Success) {
+        Write-Host "    SupplyPLR$supplyIndex not found"
+        return $null
+    }
+    
+    $spanContent = $spanMatch.Groups[1].Value
+    Write-Host "    Content: '$spanContent'"
+    
+    # Normal percentage (20%, %20*)
+    if ($spanContent -match '(\d+)%') {
+        $level = [int]$matches[1]
+        Write-Host "    Level: $level%"
+        return $level
+    }
+    
+    # Low level formats
+    if ($spanContent -match '<%(\d+)') {
+        $threshold = [int]$matches[1]
+        $actualLevel = $threshold - 1
+        Write-Host "    Low level: <$threshold% (value: $actualLevel)"
+        return $actualLevel
+    }
+    
+    if ($spanContent -match '&lt;(\d+)') {
+        $threshold = [int]$matches[1]
+        $actualLevel = $threshold - 1
+        Write-Host "    Low level HTML encoded: &lt;$threshold% (value: $actualLevel)"
+        return $actualLevel
+    }
+    
+    if ($spanContent -match '<\s*(\d+)') {
+        $threshold = [int]$matches[1]
+        $actualLevel = $threshold - 1
+        Write-Host "    Low level with space: < $threshold% (value: $actualLevel)"
+        return $actualLevel
+    }
+    
+    if ($spanContent -match 'Low|Empty|Critical') {
+        Write-Host "    Critical level keyword found: '$spanContent' (value: 5)"
+        return 5
+    }
+    
+    Write-Host "    Unknown format: '$spanContent'"
+    Write-Host "    Raw bytes: $([System.Text.Encoding]::UTF8.GetBytes($spanContent) | ForEach-Object { $_.ToString('X2') })"
+    return $null
+}
+
+# Extract printer cartridge info using range-based regex
+function Get-PrinterCartridgeInfo {
+    param([string]$ipAddress)
+    
+    Write-Host "$ipAddress - Starting check"
+    
+    $client = New-Object System.Net.WebClient
+    $client.Headers.Add("User-Agent", "Mozilla/5.0")
+    
+    $printerInfo = @{
+        IP = $ipAddress
+        Status = "ERROR"
+        IsColor = $false
+        Supplies = @()
+        HasLowToner = $false
+    }
+    
+    try {
+        Write-Host "$ipAddress - Downloading HTML"
+        $html = $client.DownloadString("http://$ipAddress")
+        Write-Host "$ipAddress - HTML downloaded: $($html.Length) chars"
+        
+        $lines = $html -split "`n"
+        Write-Host "$ipAddress - Lines: $($lines.Count)"
+        
+        # Safe range check
+        $safeStartLine = [Math]::Max(0, $SUPPLY_START_LINE)
+        $safeEndLine = [Math]::Min($lines.Count - 1, $SUPPLY_END_LINE)
+        
+        Write-Host "$ipAddress - Range: $safeStartLine - $safeEndLine"
+        
+        if ($safeStartLine -ge $safeEndLine) {
+            Write-Host "$ipAddress - Invalid range"
+            return $printerInfo
+        }
+        
+        # Extract target section
+        $targetLines = $lines[$safeStartLine..$safeEndLine]
+        $targetSection = $targetLines -join "`n"
+        Write-Host "$ipAddress - Target section: $($targetSection.Length) chars"
+        
+        # Find SupplyPLR0
+        Write-Host "$ipAddress - Searching SupplyPLR0"
+        $supply0Level = Get-TonerLevel -htmlContent $targetSection -supplyIndex 0
+        
+        if ($supply0Level -eq $null) {
+            Write-Host "$ipAddress - SupplyPLR0 not found"
+            return $printerInfo
+        }
+        
+        Write-Host "$ipAddress - SupplyPLR0 level: $supply0Level%"
+        
+        # Yellow check for color detection
+        Write-Host "$ipAddress - Yellow detection"
+        $supply0LineIndex = -1
+        for ($i = 0; $i -lt $targetLines.Count; $i++) {
+            if ($targetLines[$i] -match 'id="SupplyPLR0"') {
+                $supply0LineIndex = $i
+                Write-Host "$ipAddress - SupplyPLR0 line: $i"
+                break
+            }
+        }
+        
+        $hasYellow = $false
+        if ($supply0LineIndex -gt -1) {
+            $checkEndIndex = [Math]::Min($supply0LineIndex + $YELLOW_CHECK_LINES, $targetLines.Count - 1)
+            Write-Host "$ipAddress - Yellow check range: $supply0LineIndex - $checkEndIndex"
+            
+            $yellowCheckLines = $targetLines[$supply0LineIndex..$checkEndIndex]
+            $yellowCheckSection = $yellowCheckLines -join "`n"
+            $hasYellow = $yellowCheckSection -match "yellow"
+            
+            Write-Host "$ipAddress - Yellow found: $hasYellow"
+        }
+        
+        $printerInfo.Status = "OK"
+        $printerInfo.IsColor = $hasYellow
+        
+        if ($hasYellow) {
+            Write-Host "$ipAddress - COLOR printer detected"
+            
+            # Color printer: check supplies 0, 1, 2, 3
+            for ($i = 0; $i -le 3; $i++) {
+                $level = Get-TonerLevel -htmlContent $targetSection -supplyIndex $i
+                
+                if ($level -ne $null) {
+                    $supplyName = switch ($i) {
+                        0 { "Black" }
+                        1 { "Cyan" }
+                        2 { "Magenta" }
+                        3 { "Yellow" }
+                    }
+                    
+                    $supply = @{
+                        Name = $supplyName
+                        Level = $level
+                        Index = $i
+                        IsLow = ($level -le 20)
+                    }
+                    
+                    $printerInfo.Supplies += $supply
+                    
+                    $displayLevel = if ($level -lt 10) { "<$($level + 1)" } else { $level.ToString() }
+                    Write-Host "$ipAddress - $supplyName : $displayLevel%"
+                    
+                    if ($level -le 20) {
+                        $printerInfo.HasLowToner = $true
+                        Write-Host "$ipAddress - $supplyName low level"
+                    }
+                }
+            }
+        } else {
+            Write-Host "$ipAddress - MONO printer detected"
+            
+            # Mono printer: only SupplyPLR0
+            $supply = @{
+                Name = "Black"
+                Level = $supply0Level
+                Index = 0
+                IsLow = ($supply0Level -le 20)
+            }
+            
+            $printerInfo.Supplies += $supply
+            
+            $displayLevel = if ($supply0Level -lt 10) { "<$($supply0Level + 1)" } else { $supply0Level.ToString() }
+            Write-Host "$ipAddress - Black : $displayLevel%"
+            
+            if ($supply0Level -le 20) {
+                $printerInfo.HasLowToner = $true
+                Write-Host "$ipAddress - Black low level"
+            }
+        }
+        
+        Write-Host "$ipAddress - Check completed"
+        return $printerInfo
+        
+    } catch {
+        Write-Host "$ipAddress - CONNECTION ERROR: $($_.Exception.Message)"
+        return $printerInfo
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
+}
+
+# Send email for low toner printers
+function Send-LowTonerEmail {
+    param([array]$lowTonerPrinters)
+    
+    Write-Host "Preparing emails"
+    
+    try {
+        # Send separate email for each low toner
+        foreach ($printer in $lowTonerPrinters) {
+            foreach ($supply in $printer.Supplies) {
+                if ($supply.IsLow) {
+                    $displayLevel = if ($supply.Level -lt 10) { "<$($supply.Level + 1)" } else { $supply.Level.ToString() }
+                    
+                    $emailSubject = "PRINTER TONER ALERT - $($printer.IP) - $($supply.Name)"
+                    
+                    $emailBody = @"
+Dear Manager,
+
+Printer $($printer.IP) has reached critical toner level.
+
+Details:
+- Printer IP: $($printer.IP)
+- Printer Type: $($printer.IsColor ? 'Color' : 'Mono')
+- Toner: $($supply.Name)
+- Current Level: $displayLevel%
+- Status: Critical Level
+
+Please order replacement cartridge.
+
+Best regards,
+Printer Monitoring System
+
+---
+This email was sent automatically.
+Date: $(Get-Date -Format 'dd.MM.yyyy HH:mm')
+"@
+                    
+                    Write-Host "Sending email: $($printer.IP) - $($supply.Name)"
+                    
+                    # SMTP configuration
+                    $smtpClient = New-Object System.Net.Mail.SmtpClient
+                    $smtpClient.Host = $EMAIL_SMTP_SERVER
+                    $smtpClient.Port = $EMAIL_PORT
+                    $smtpClient.EnableSsl = $false
+                    $smtpClient.UseDefaultCredentials = $false
+                    $smtpClient.Credentials = $null
+                    
+                    # Create email message
+                    $mailMessage = New-Object System.Net.Mail.MailMessage
+                    $mailMessage.From = $EMAIL_FROM
+                    $mailMessage.To.Add($EMAIL_TO)
+                    $mailMessage.Subject = $emailSubject
+                    $mailMessage.Body = $emailBody
+                    $mailMessage.IsBodyHtml = $false
+                    
+                    # Send email
+                    $smtpClient.Send($mailMessage)
+                    
+                    Write-Host "Email sent: $($printer.IP) - $($supply.Name)"
+                    
+                    # Cleanup
+                    $mailMessage.Dispose()
+                    $smtpClient.Dispose()
+                    
+                    # Delay between emails
+                    Start-Sleep -Seconds 2
+                }
+            }
+        }
+        
+        Write-Host "All emails sent successfully"
+        
+    } catch {
+        Write-Host "Email sending error:"
+        Write-Host "Error Type: $($_.Exception.GetType().Name)"
+        Write-Host "Error Message: $($_.Exception.Message)"
+        if ($_.Exception.InnerException) {
+            Write-Host "Inner Error: $($_.Exception.InnerException.Message)"
+        }
+        Write-Host "Stack Trace: $($_.Exception.StackTrace)"
+        Write-Host ""
+        Write-Host "EMAIL SETTINGS CHECK:"
+        Write-Host "SMTP Server: $EMAIL_SMTP_SERVER"
+        Write-Host "Port: $EMAIL_PORT"
+        Write-Host "From: $EMAIL_FROM"
+        Write-Host "To: $EMAIL_TO"
+        Write-Host "Password Length: $($EMAIL_PASSWORD.Length) characters"
+    }
+}
+
+# Main program
+Write-Host "HP PRINTER TONER MONITOR"
+Write-Host "========================"
+Write-Host "Range: $SUPPLY_START_LINE - $SUPPLY_END_LINE"
+Write-Host "Yellow check: $YELLOW_CHECK_LINES lines"
+Write-Host "Printers: $($printerIPs.Count)"
+Write-Host ""
+
+$allPrinters = @()
+$lowTonerPrinters = @()
+
+# Check all printers
+foreach ($ip in $printerIPs) {
+    Write-Host ">>> Checking $ip <<<"
+    $printerInfo = Get-PrinterCartridgeInfo -ipAddress $ip
+    $allPrinters += $printerInfo
+    
+    if ($printerInfo.HasLowToner) {
+        $lowTonerPrinters += $printerInfo
+    }
+    Write-Host ">>> $ip completed <<<"
+    Write-Host ""
+}
+
+# Display results
+Write-Host "RESULTS"
+Write-Host "======="
+Write-Host "Total printers: $($allPrinters.Count)"
+Write-Host "Low toner: $($lowTonerPrinters.Count)"
+Write-Host ""
+
+if ($lowTonerPrinters.Count -gt 0) {
+    Write-Host "REPLACEMENT NEEDED:"
+    foreach ($printer in $lowTonerPrinters) {
+        Write-Host "$($printer.IP)"
+    }
+    
+    Write-Host ""
+    Send-LowTonerEmail -lowTonerPrinters $lowTonerPrinters
+    
+} else {
+    Write-Host "ALL PRINTERS OK"
+}
+
+Write-Host ""
+Write-Host "Check completed"
+Write-Host "==============="
+Write-Host ""
+Write-Host "Press any key to exit..."
+Read-Host
