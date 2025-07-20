@@ -103,7 +103,7 @@ When toner levels reach 20% or below, the system sends detailed email alerts:
 ```
 Subject: PRINTER TONER ALERT - 192.168.1.100 - Magenta
 
-Dear Manage,
+Dear Manager,
 
 Printer 192.168.1.100 has reached critical toner level.
 
